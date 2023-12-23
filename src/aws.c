@@ -1,26 +1,28 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
+#include <arpa/inet.h>
+#include <asm-generic/socket.h>
+#include <assert.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <libaio.h>
+#include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <assert.h>
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <sys/sendfile.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <sys/epoll.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <sys/sendfile.h>
-#include <sys/eventfd.h>
-#include <libaio.h>
-#include <errno.h>
 
 #include "aws.h"
-#include "utils/util.h"
+#include "http-parser/http_parser.h"
 #include "utils/debug.h"
 #include "utils/sock_util.h"
+#include "utils/util.h"
 #include "utils/w_epoll.h"
 
 /* server socket file descriptor */
@@ -54,17 +56,25 @@ static void connection_prepare_send_404(struct connection *conn)
 
 static enum resource_type connection_get_resource_type(struct connection *conn)
 {
-	/* TODO: Get resource type depending on request path/filename. Filename should
-	 * point to the static or dynamic folder.
+	/* TODO: Get resource type depending on request path/filename. Filename
+	 * should point to the static or dynamic folder.
 	 */
 	return RESOURCE_TYPE_NONE;
 }
 
-
+/** Initialize connection structure on given socket. */
 struct connection *connection_create(int sockfd)
 {
-	/* TODO: Initialize connection structure on given socket. */
-	return NULL;
+	struct connection *conn;
+
+	conn = malloc(sizeof(*conn));
+	DIE(!conn, "malloc");
+
+	conn->sockfd = sockfd;
+	conn->state = STATE_NO_STATE;
+	memset(conn->recv_buffer, 0, BUFSIZ);
+	memset(conn->send_buffer, 0, BUFSIZ);
+	return conn;
 }
 
 void connection_start_async_io(struct connection *conn)
@@ -81,17 +91,35 @@ void connection_remove(struct connection *conn)
 
 void handle_new_connection(void)
 {
-	/* TODO: Handle a new connection request on the server socket. */
+	int sockfd;
+	struct sockaddr_in addr;
+	socklen_t addrlen = sizeof(addr);
+	struct connection *conn;
+	int opt = 1;
+	int rc;
 
-	/* TODO: Accept new connection. */
+	/* Handle a new connection request on the server socket. */
 
-	/* TODO: Set socket to be non-blocking. */
+	/* Accept new connection. */
+	sockfd = accept(listenfd, (SSA *)&addr, &addrlen);
+	DIE(sockfd < 0, "accept");
 
-	/* TODO: Instantiate new connection handler. */
+	dlog(LOG_INFO, "Accepted connection from: %s:%d\n",
+		 inet_ntoa(addr.sin_addr), ntohs(addr.sin_port));
 
-	/* TODO: Add socket to epoll. */
+	/* Set socket to be non-blocking. */
+	rc = fcntl(sockfd, F_SETFL, O_NONBLOCK);
+	DIE(rc < 0, "fcntl");
 
-	/* TODO: Initialize HTTP_REQUEST parser. */
+	/* Instantiate new connection handler. */
+	conn = connection_create(sockfd);
+
+	/* Add socket to epoll. */
+	rc = w_epoll_add_ptr_in(epollfd, sockfd, conn);
+	DIE(rc < 0, "w_epoll_add_ptr_in");
+
+	/* Initialize HTTP_REQUEST parser. */
+	http_parser_init(&conn->request_parser, HTTP_REQUEST);
 }
 
 void receive_data(struct connection *conn)
@@ -119,18 +147,16 @@ int parse_header(struct connection *conn)
 {
 	/* TODO: Parse the HTTP header and extract the file path. */
 	/* Use mostly null settings except for on_path callback. */
-	http_parser_settings settings_on_path = {
-		.on_message_begin = 0,
-		.on_header_field = 0,
-		.on_header_value = 0,
-		.on_path = aws_on_path_cb,
-		.on_url = 0,
-		.on_fragment = 0,
-		.on_query_string = 0,
-		.on_body = 0,
-		.on_headers_complete = 0,
-		.on_message_complete = 0
-	};
+	http_parser_settings settings_on_path = {.on_message_begin = 0,
+											 .on_header_field = 0,
+											 .on_header_value = 0,
+											 .on_path = aws_on_path_cb,
+											 .on_url = 0,
+											 .on_fragment = 0,
+											 .on_query_string = 0,
+											 .on_body = 0,
+											 .on_headers_complete = 0,
+											 .on_message_complete = 0};
 	return 0;
 }
 
@@ -149,7 +175,6 @@ int connection_send_data(struct connection *conn)
 	return -1;
 }
 
-
 int connection_send_dynamic(struct connection *conn)
 {
 	/* TODO: Read data asynchronously.
@@ -157,7 +182,6 @@ int connection_send_dynamic(struct connection *conn)
 	 */
 	return 0;
 }
-
 
 void handle_input(struct connection *conn)
 {
@@ -173,8 +197,9 @@ void handle_input(struct connection *conn)
 
 void handle_output(struct connection *conn)
 {
-	/* TODO: Handle output information: may be a new valid requests or notification of
-	 * completion of an asynchronous I/O operation or invalid requests.
+	/* TODO: Handle output information: may be a new valid requests or
+	 * notification of completion of an asynchronous I/O operation or invalid
+	 * requests.
 	 */
 
 	switch (conn->state) {
@@ -195,27 +220,54 @@ int main(void)
 {
 	int rc;
 
-	/* TODO: Initialize asynchronous operations. */
+	/* Initialize asynchronous operations. */
+	epollfd = w_epoll_create();
+	DIE(epollfd < 0, "epoll_create1");
 
 	/* TODO: Initialize multiplexing. */
 
-	/* TODO: Create server socket. */
+	/* Create server socket. */
+	listenfd = tcp_create_listener(AWS_LISTEN_PORT, DEFAULT_LISTEN_BACKLOG);
+	DIE(listenfd < 0, "tcp_create_listener");
 
-	/* TODO: Add server socket to epoll object*/
+	/* Add server socket to epoll object */
+	rc = w_epoll_add_fd_in(epollfd, listenfd);
+	DIE(rc < 0, "w_epoll_add_fd_in");
 
-	/* Uncomment the following line for debugging. */
-	// dlog(LOG_INFO, "Server waiting for connections on port %d\n", AWS_LISTEN_PORT);
+	dlog(LOG_INFO, "Server waiting for connections on port %d\n",
+		 AWS_LISTEN_PORT);
 
 	/* server main loop */
 	while (1) {
 		struct epoll_event rev;
 
-		/* TODO: Wait for events. */
+		/* Wait for events. */
+		rc = w_epoll_wait_infinite(epollfd, &rev);
+		DIE(rc < 0, "epoll_wait");
 
-		/* TODO: Switch event types; consider
+		/* Switch event types; consider
 		 *   - new connection requests (on server socket)
 		 *   - socket communication (on connection sockets)
 		 */
+
+		/* The server listener got an I/O event. */
+		if (rev.data.fd == listenfd) {
+			dlog(LOG_INFO, "New connection\n");
+			if (rev.events & EPOLLIN) {
+				handle_new_connection();
+				continue;
+			}
+		}
+
+		/* A connection socket got an I/O event. */
+		if (rev.events & EPOLLIN) {
+			dlog(LOG_INFO, "New message\n");
+			handle_input(rev.data.ptr);
+		}
+		if (rev.events & EPOLLOUT) {
+			dlog(LOG_INFO, "Ready to send message\n");
+			handle_output(rev.data.ptr);
+		}
 	}
 
 	return 0;
