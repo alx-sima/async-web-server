@@ -188,7 +188,6 @@ void handle_new_connection(void)
 void receive_data(struct connection *conn)
 {
 	int recv_bytes;
-	int rc;
 
 	recv_bytes = recv(conn->sockfd, conn->recv_buffer, BUFSIZ, 0);
 	if (recv_bytes < 0) {
@@ -209,13 +208,14 @@ void receive_data(struct connection *conn)
 int connection_open_file(struct connection *conn)
 {
 	char path[BUFSIZ] = AWS_DOCUMENT_ROOT;
-	strlcat(path, conn->request_path, SIZE(path));
+	struct stat stat;
+
+	strncat(path, conn->request_path, SIZE(path) - strlen(path) - 1);
 
 	conn->fd = open(path, O_RDONLY | O_NONBLOCK);
 	if (conn->fd < 0)
 		return conn->fd;
 
-	struct stat stat;
 	fstat(conn->fd, &stat);
 	conn->file_size = stat.st_size;
 	return conn->fd;
@@ -294,7 +294,6 @@ int connection_send_dynamic(struct connection *conn)
 void handle_input(struct connection *conn)
 {
 	switch (conn->state) {
-
 	/* Received a HTTP request. */
 	case STATE_INITIAL:
 		receive_data(conn);
@@ -323,7 +322,6 @@ void handle_input(struct connection *conn)
 void handle_output(struct connection *conn)
 {
 	switch (conn->state) {
-
 	/* A 404 error was sent. */
 	case STATE_SENDING_404:
 		connection_remove(conn);
@@ -361,9 +359,8 @@ void handle_client(uint32_t event, struct connection *conn)
 		dlog(LOG_INFO, "New message from %s\n", addr);
 		handle_input(conn);
 	}
-	if (event & EPOLLOUT) {
+	if (event & EPOLLOUT)
 		handle_output(conn);
-	}
 }
 
 int main(void)
