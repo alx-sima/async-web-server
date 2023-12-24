@@ -46,9 +46,28 @@ static int aws_on_path_cb(http_parser *p, const char *buf, size_t len)
 	return 0;
 }
 
+/** Prepare the connection buffer to send the reply header. */
 static void connection_prepare_send_reply_header(struct connection *conn)
 {
-	/* TODO: Prepare the connection buffer to send the reply header. */
+	conn->state = STATE_SENDING_HEADER;
+	int rc;
+
+	snprintf(conn->send_buffer, BUFSIZ,
+			 "HTTP/1.1 200 OK\r\n"
+			 "Connexion: close\r\n"
+			 "Content-Length: %ld\r\n"
+			 "\r\n",
+			 conn->file_size);
+	conn->send_len = strlen(conn->send_buffer);
+
+	rc = w_epoll_add_ptr_out(epollfd, conn->eventfd, conn);
+	io_prep_pwrite(&conn->iocb, conn->sockfd, conn->send_buffer, conn->send_len,
+				   0);
+	io_set_eventfd(&conn->iocb, conn->eventfd);
+	rc = io_submit(ctx, 1, conn->piocb);
+	DIE(rc < 0, "io_submit");
+
+	dlog(LOG_DEBUG, "Prepared reply header: %s\n", conn->send_buffer);
 }
 
 /** Prepare the connection buffer to send the 404 header. */
@@ -70,13 +89,28 @@ static void connection_prepare_send_404(struct connection *conn)
 	DIE(rc < 0, "io_submit");
 }
 
+/**
+ * Get resource type depending on request path/filename. Filename
+ * should point to the static or dynamic folder.
+ */
 static enum resource_type connection_get_resource_type(struct connection *conn)
 {
-	/* TODO: Get resource type depending on request path/filename. Filename
-	 * should point to the static or dynamic folder.
-	 */
-	puts(conn->request_path);
-	return RESOURCE_TYPE_NONE;
+	static const char static_path[] = "/static";
+	static const char dynamic_path[] = "/dynamic";
+	enum resource_type type = RESOURCE_TYPE_NONE;
+
+	if (!strncmp(conn->request_path, static_path, SIZE(static_path) - 1))
+		type = RESOURCE_TYPE_STATIC;
+	else if (!strncmp(conn->request_path, dynamic_path, SIZE(dynamic_path) - 1))
+		type = RESOURCE_TYPE_DYNAMIC;
+
+	if (connection_open_file(conn) < 0) {
+		/* File doesn't exist, send a 404. */
+		if (errno == ENOENT)
+			return RESOURCE_TYPE_NONE;
+		// TODO
+	}
+	return type;
 }
 
 /** Initialize connection structure on given socket. */
@@ -93,7 +127,8 @@ struct connection *connection_create(int sockfd)
 
 	conn->state = STATE_INITIAL;
 	*conn->piocb = &conn->iocb;
-	memset(conn->recv_buffer, 0, BUFSIZ);
+	io_set_eventfd(&conn->iocb, conn->eventfd);
+	conn->ctx = memset(conn->recv_buffer, 0, BUFSIZ);
 	memset(conn->send_buffer, 0, BUFSIZ);
 	return conn;
 }
@@ -108,6 +143,7 @@ void connection_start_async_io(struct connection *conn)
 /** Remove connection handler. */
 void connection_remove(struct connection *conn)
 {
+	w_epoll_remove_ptr(epollfd, conn->sockfd, conn);
 	w_epoll_remove_ptr(epollfd, conn->eventfd, conn);
 	free(conn);
 }
@@ -158,28 +194,31 @@ void receive_data(struct connection *conn)
 	if (recv_bytes < 0) {
 		// dlog(LOG_ERR, "Error in communication from %s\n",
 		//  inet_ntoa(conn->addr.sin_addr));
-		goto close_connection;
+		connection_remove(conn);
 	} else if (!recv_bytes) {
 		// dlog(LOG_INFO, "Connection closed from %s\n",
 		//  inet_ntoa(conn->addr.sin_addr));
-		goto close_connection;
+		connection_remove(conn);
 	}
 
 	conn->recv_len = recv_bytes;
 	conn->state = STATE_REQUEST_RECEIVED;
-	return;
-
-close_connection:
-	rc = w_epoll_remove_ptr(epollfd, conn->sockfd, conn);
-	DIE(rc < 0, "w_epoll_remove_ptr");
-
-	connection_remove(conn);
 }
 
 /** Open file and update connection fields. */
 int connection_open_file(struct connection *conn)
 {
-	return conn->fd = open(conn->request_path, O_RDONLY);
+	char path[BUFSIZ] = AWS_DOCUMENT_ROOT;
+	strlcat(path, conn->request_path, SIZE(path));
+
+	conn->fd = open(path, O_RDONLY | O_NONBLOCK);
+	if (conn->fd < 0)
+		return conn->fd;
+
+	struct stat stat;
+	fstat(conn->fd, &stat);
+	conn->file_size = stat.st_size;
+	return conn->fd;
 }
 
 void connection_complete_async_io(struct connection *conn)
@@ -215,7 +254,20 @@ int parse_header(struct connection *conn)
 enum connection_state connection_send_static(struct connection *conn)
 {
 	/* TODO: Send static data using sendfile(2). */
-	return STATE_NO_STATE;
+	conn->state = STATE_SENDING_DATA;
+	int rc;
+
+	rc = sendfile(conn->sockfd, conn->fd, 0, conn->send_len);
+	DIE(rc < 0, "sendfile");
+
+	if (rc == 0) {
+		dlog(LOG_INFO, "Package sent\n");
+		connection_remove(conn);
+		return STATE_NO_STATE;
+	}
+
+	dlog(LOG_DEBUG, "Sent %d bytes of static data\n", rc);
+	return STATE_SENDING_DATA;
 }
 
 int connection_send_data(struct connection *conn)
@@ -253,10 +305,12 @@ void handle_input(struct connection *conn)
 		if (conn->res_type == RESOURCE_TYPE_NONE)
 			/* The file doesn't exist, send a 404. */
 			connection_prepare_send_404(conn);
+		else
+			connection_prepare_send_reply_header(conn);
 		break;
 
 	default:
-		ERR("Unexpected state\n");
+		ERR("Unexpected state");
 		exit(1);
 	}
 }
@@ -275,8 +329,16 @@ void handle_output(struct connection *conn)
 		connection_remove(conn);
 		break;
 
+	/* Header was sent. */
+	case STATE_SENDING_HEADER:
+	/* Currently sending the file. */
+	case STATE_SENDING_DATA:
+		if (conn->res_type == RESOURCE_TYPE_STATIC)
+			connection_send_static(conn);
+		break;
+
 	default:
-		ERR("Unexpected state\n");
+		ERR("Unexpected state");
 		exit(1);
 	}
 }
@@ -300,7 +362,6 @@ void handle_client(uint32_t event, struct connection *conn)
 		handle_input(conn);
 	}
 	if (event & EPOLLOUT) {
-		dlog(LOG_INFO, "Ready to send message %s\n", addr);
 		handle_output(conn);
 	}
 }
@@ -345,18 +406,9 @@ int main(void)
 		if (rev.data.fd == listenfd) {
 			if (rev.events & EPOLLIN) {
 				dlog(LOG_INFO, "New connection\n");
-				dlog(LOG_INFO, "New connection\n");
-				if (rev.events & EPOLLIN) {
-					dlog(LOG_INFO, "New connection\n");
-					if (rev.events & EPOLLIN) {
-						handle_new_connection();
-					}
-
-					continue;
-					continue;
-				}
-				continue;
+				handle_new_connection();
 			}
+			continue;
 		}
 
 		/* A connection socket got an I/O event. */
