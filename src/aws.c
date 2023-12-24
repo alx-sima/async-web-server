@@ -59,15 +59,13 @@ static void connection_prepare_send_reply_header(struct connection *conn)
 			 "\r\n",
 			 conn->file_size);
 	conn->send_len = strlen(conn->send_buffer);
+	dlog(LOG_DEBUG, "Prepared reply header (%lu bytes)\n", conn->send_len);
 
 	rc = w_epoll_add_ptr_out(epollfd, conn->eventfd, conn);
 	io_prep_pwrite(&conn->iocb, conn->sockfd, conn->send_buffer, conn->send_len,
 				   0);
-	io_set_eventfd(&conn->iocb, conn->eventfd);
 	rc = io_submit(ctx, 1, conn->piocb);
 	DIE(rc < 0, "io_submit");
-
-	dlog(LOG_DEBUG, "Prepared reply header: %s\n", conn->send_buffer);
 }
 
 /** Prepare the connection buffer to send the 404 header. */
@@ -84,7 +82,6 @@ static void connection_prepare_send_404(struct connection *conn)
 
 	io_prep_pwrite(&conn->iocb, conn->sockfd, conn->send_buffer, conn->send_len,
 				   0);
-	io_set_eventfd(&conn->iocb, conn->eventfd);
 	rc = io_submit(ctx, 1, conn->piocb);
 	DIE(rc < 0, "io_submit");
 }
@@ -126,6 +123,7 @@ struct connection *connection_create(int sockfd)
 	DIE(conn->eventfd < 0, "eventfd");
 
 	conn->state = STATE_INITIAL;
+	conn->file_pos = 0;
 	*conn->piocb = &conn->iocb;
 	io_set_eventfd(&conn->iocb, conn->eventfd);
 	conn->ctx = memset(conn->recv_buffer, 0, BUFSIZ);
@@ -138,6 +136,15 @@ void connection_start_async_io(struct connection *conn)
 	/* TODO: Start asynchronous operation (read from file).
 	 * Use io_submit(2) & friends for reading data asynchronously.
 	 */
+	conn->state = STATE_ASYNC_ONGOING;
+	dlog(LOG_DEBUG, "Starting async IO\n");
+	// int rc = w_epoll_update_ptr_in(epollfd, conn->eventfd, conn);
+	dlog(LOG_DEBUG, "%lu\n", conn->file_size);
+	memset(conn->send_buffer, 0, SIZE(conn->send_buffer));
+	io_prep_pread(&conn->iocb, conn->fd, conn->send_buffer, conn->file_size, 0);
+	int rc = io_submit(ctx, 1, conn->piocb);
+
+	DIE(rc < 0, "io_submit");
 }
 
 /** Remove connection handler. */
@@ -226,6 +233,8 @@ void connection_complete_async_io(struct connection *conn)
 	/* TODO: Complete asynchronous operation; operation returns successfully.
 	 * Prepare socket for sending.
 	 */
+	conn->state = STATE_SENDING_DATA;
+	dlog(LOG_DEBUG, "Async IO completed\n");
 }
 
 /** Parse the HTTP header and extract the file path. */
@@ -284,6 +293,18 @@ int connection_send_dynamic(struct connection *conn)
 	/* TODO: Read data asynchronously.
 	 * Returns 0 on success and -1 on error.
 	 */
+	int rc;
+
+	rc = send(conn->sockfd, conn->send_buffer + conn->file_pos,
+			  conn->file_size - conn->file_pos, O_NONBLOCK);
+	DIE(rc < 0, "send");
+	if (rc == 0) {
+		dlog(LOG_INFO, "Package sent\n");
+		connection_remove(conn);
+		return 0;
+	}
+	dlog(LOG_DEBUG, "Sent %d bytes of dynamic data\n", rc);
+	conn->file_pos += rc;
 	return 0;
 }
 
@@ -329,12 +350,25 @@ void handle_output(struct connection *conn)
 
 	/* Header was sent. */
 	case STATE_SENDING_HEADER:
+		dlog(LOG_INFO, "Header sent\n");
+		if (conn->res_type == RESOURCE_TYPE_DYNAMIC) {
+			// w_epoll_remove_ptr(epollfd, conn->sockfd, conn);
+			connection_start_async_io(conn);
+			break;
+		}
+
 	/* Currently sending the file. */
 	case STATE_SENDING_DATA:
 		if (conn->res_type == RESOURCE_TYPE_STATIC)
 			connection_send_static(conn);
+		else
+			connection_send_dynamic(conn);
 		break;
 
+	/* Asynchronous I/O operation completed. */
+	case STATE_ASYNC_ONGOING:
+		connection_complete_async_io(conn);
+		break;
 	default:
 		ERR("Unexpected state");
 		exit(1);
@@ -358,9 +392,9 @@ void handle_client(uint32_t event, struct connection *conn)
 	if (event & EPOLLIN) {
 		dlog(LOG_INFO, "New message from %s\n", addr);
 		handle_input(conn);
-	}
-	if (event & EPOLLOUT)
+	} else if (event & EPOLLOUT) {
 		handle_output(conn);
+	}
 }
 
 int main(void)
@@ -372,7 +406,7 @@ int main(void)
 	DIE(epollfd < 0, "epoll_create1");
 
 	/* Initialize multiplexing. */
-	rc = io_setup(10, &ctx);
+	rc = io_setup(1000, &ctx);
 	DIE(rc < 0, "io_setup");
 
 	/* Create server socket. */
@@ -411,6 +445,5 @@ int main(void)
 		/* A connection socket got an I/O event. */
 		handle_client(rev.events, rev.data.ptr);
 	}
-
 	return 0;
 }
