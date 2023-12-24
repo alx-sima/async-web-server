@@ -25,6 +25,8 @@
 #include "utils/util.h"
 #include "utils/w_epoll.h"
 
+#define SIZE(x) (sizeof(x) / sizeof(*(x)))
+
 /* server socket file descriptor */
 static int listenfd;
 
@@ -49,9 +51,23 @@ static void connection_prepare_send_reply_header(struct connection *conn)
 	/* TODO: Prepare the connection buffer to send the reply header. */
 }
 
+/** Prepare the connection buffer to send the 404 header. */
 static void connection_prepare_send_404(struct connection *conn)
 {
-	/* TODO: Prepare the connection buffer to send the 404 header. */
+	conn->state = STATE_SENDING_404;
+	int rc;
+
+	strcpy(conn->send_buffer, "HTTP/1.1 404 Not Found\r\n\r\n");
+	conn->send_len = strlen(conn->send_buffer);
+
+	rc = w_epoll_add_ptr_out(epollfd, conn->eventfd, conn);
+	DIE(rc < 0, "w_epoll_update_fd_out");
+
+	io_prep_pwrite(&conn->iocb, conn->sockfd, conn->send_buffer, conn->send_len,
+				   0);
+	io_set_eventfd(&conn->iocb, conn->eventfd);
+	rc = io_submit(ctx, 1, conn->piocb);
+	DIE(rc < 0, "io_submit");
 }
 
 static enum resource_type connection_get_resource_type(struct connection *conn)
@@ -59,6 +75,7 @@ static enum resource_type connection_get_resource_type(struct connection *conn)
 	/* TODO: Get resource type depending on request path/filename. Filename
 	 * should point to the static or dynamic folder.
 	 */
+	puts(conn->request_path);
 	return RESOURCE_TYPE_NONE;
 }
 
@@ -71,7 +88,11 @@ struct connection *connection_create(int sockfd)
 	DIE(!conn, "malloc");
 
 	conn->sockfd = sockfd;
-	conn->state = STATE_NO_STATE;
+	conn->eventfd = eventfd(0, 0);
+	DIE(conn->eventfd < 0, "eventfd");
+
+	conn->state = STATE_INITIAL;
+	*conn->piocb = &conn->iocb;
 	memset(conn->recv_buffer, 0, BUFSIZ);
 	memset(conn->send_buffer, 0, BUFSIZ);
 	return conn;
@@ -84,18 +105,19 @@ void connection_start_async_io(struct connection *conn)
 	 */
 }
 
+/** Remove connection handler. */
 void connection_remove(struct connection *conn)
 {
-	/* TODO: Remove connection handler. */
+	w_epoll_remove_ptr(epollfd, conn->eventfd, conn);
+	free(conn);
 }
 
 void handle_new_connection(void)
 {
-	int sockfd;
+	struct connection *conn;
 	struct sockaddr_in addr;
 	socklen_t addrlen = sizeof(addr);
-	struct connection *conn;
-	int opt = 1;
+	int sockfd;
 	int rc;
 
 	/* Handle a new connection request on the server socket. */
@@ -120,20 +142,44 @@ void handle_new_connection(void)
 
 	/* Initialize HTTP_REQUEST parser. */
 	http_parser_init(&conn->request_parser, HTTP_REQUEST);
+	conn->request_parser.data = conn;
 }
 
+/**
+ * Receive message on socket.
+ * Store message in recv_buffer in struct connection.
+ */
 void receive_data(struct connection *conn)
 {
-	/* TODO: Receive message on socket.
-	 * Store message in recv_buffer in struct connection.
-	 */
+	int recv_bytes;
+	int rc;
+
+	recv_bytes = recv(conn->sockfd, conn->recv_buffer, BUFSIZ, 0);
+	if (recv_bytes < 0) {
+		// dlog(LOG_ERR, "Error in communication from %s\n",
+		//  inet_ntoa(conn->addr.sin_addr));
+		goto close_connection;
+	} else if (!recv_bytes) {
+		// dlog(LOG_INFO, "Connection closed from %s\n",
+		//  inet_ntoa(conn->addr.sin_addr));
+		goto close_connection;
+	}
+
+	conn->recv_len = recv_bytes;
+	conn->state = STATE_REQUEST_RECEIVED;
+	return;
+
+close_connection:
+	rc = w_epoll_remove_ptr(epollfd, conn->sockfd, conn);
+	DIE(rc < 0, "w_epoll_remove_ptr");
+
+	connection_remove(conn);
 }
 
+/** Open file and update connection fields. */
 int connection_open_file(struct connection *conn)
 {
-	/* TODO: Open file and update connection fields. */
-
-	return -1;
+	return conn->fd = open(conn->request_path, O_RDONLY);
 }
 
 void connection_complete_async_io(struct connection *conn)
@@ -143,9 +189,9 @@ void connection_complete_async_io(struct connection *conn)
 	 */
 }
 
+/** Parse the HTTP header and extract the file path. */
 int parse_header(struct connection *conn)
 {
-	/* TODO: Parse the HTTP header and extract the file path. */
 	/* Use mostly null settings except for on_path callback. */
 	http_parser_settings settings_on_path = {.on_message_begin = 0,
 											 .on_header_field = 0,
@@ -157,7 +203,13 @@ int parse_header(struct connection *conn)
 											 .on_body = 0,
 											 .on_headers_complete = 0,
 											 .on_message_complete = 0};
-	return 0;
+	size_t bytes_parsed =
+		http_parser_execute(&conn->request_parser, &settings_on_path,
+							conn->recv_buffer, conn->recv_len);
+
+	dlog(LOG_DEBUG, "Parsed HTTP request, bytes: %lu, path: %s\n", bytes_parsed,
+		 conn->request_path);
+	return bytes_parsed;
 }
 
 enum connection_state connection_send_static(struct connection *conn)
@@ -183,37 +235,74 @@ int connection_send_dynamic(struct connection *conn)
 	return 0;
 }
 
+/**
+ * Handle input information: may be a new message or notification of
+ * completion of an asynchronous I/O operation.
+ */
 void handle_input(struct connection *conn)
 {
-	/* TODO: Handle input information: may be a new message or notification of
-	 * completion of an asynchronous I/O operation.
-	 */
-
 	switch (conn->state) {
-	default:
-		printf("shouldn't get here %d\n", conn->state);
-	}
-}
 
-void handle_output(struct connection *conn)
-{
-	/* TODO: Handle output information: may be a new valid requests or
-	 * notification of completion of an asynchronous I/O operation or invalid
-	 * requests.
-	 */
+	/* Received a HTTP request. */
+	case STATE_INITIAL:
+		receive_data(conn);
+		parse_header(conn);
+		conn->state = STATE_REQUEST_RECEIVED;
+		conn->res_type = connection_get_resource_type(conn);
 
-	switch (conn->state) {
+		if (conn->res_type == RESOURCE_TYPE_NONE)
+			/* The file doesn't exist, send a 404. */
+			connection_prepare_send_404(conn);
+		break;
+
 	default:
 		ERR("Unexpected state\n");
 		exit(1);
 	}
 }
 
+/**
+ * Handle output information: may be a new valid requests or
+ * notification of completion of an asynchronous I/O operation or invalid
+ * requests.
+ */
+void handle_output(struct connection *conn)
+{
+	switch (conn->state) {
+
+	/* A 404 error was sent. */
+	case STATE_SENDING_404:
+		connection_remove(conn);
+		break;
+
+	default:
+		ERR("Unexpected state\n");
+		exit(1);
+	}
+}
+
+/**
+ * Handle new client. There can be input and output connections.
+ * Take care of what happened at the end of a connection.
+ */
 void handle_client(uint32_t event, struct connection *conn)
 {
-	/* TODO: Handle new client. There can be input and output connections.
-	 * Take care of what happened at the end of a connection.
-	 */
+	char addr[64];
+
+	if (get_peer_address(conn->sockfd, addr, SIZE(addr)) < 0) {
+		ERR("get_peer_address");
+		connection_remove(conn);
+		return;
+	}
+
+	if (event & EPOLLIN) {
+		dlog(LOG_INFO, "New message from %s\n", addr);
+		handle_input(conn);
+	}
+	if (event & EPOLLOUT) {
+		dlog(LOG_INFO, "Ready to send message %s\n", addr);
+		handle_output(conn);
+	}
 }
 
 int main(void)
@@ -224,7 +313,9 @@ int main(void)
 	epollfd = w_epoll_create();
 	DIE(epollfd < 0, "epoll_create1");
 
-	/* TODO: Initialize multiplexing. */
+	/* Initialize multiplexing. */
+	rc = io_setup(10, &ctx);
+	DIE(rc < 0, "io_setup");
 
 	/* Create server socket. */
 	listenfd = tcp_create_listener(AWS_LISTEN_PORT, DEFAULT_LISTEN_BACKLOG);
@@ -252,22 +343,24 @@ int main(void)
 
 		/* The server listener got an I/O event. */
 		if (rev.data.fd == listenfd) {
-			dlog(LOG_INFO, "New connection\n");
 			if (rev.events & EPOLLIN) {
-				handle_new_connection();
+				dlog(LOG_INFO, "New connection\n");
+				dlog(LOG_INFO, "New connection\n");
+				if (rev.events & EPOLLIN) {
+					dlog(LOG_INFO, "New connection\n");
+					if (rev.events & EPOLLIN) {
+						handle_new_connection();
+					}
+
+					continue;
+					continue;
+				}
 				continue;
 			}
 		}
 
 		/* A connection socket got an I/O event. */
-		if (rev.events & EPOLLIN) {
-			dlog(LOG_INFO, "New message\n");
-			handle_input(rev.data.ptr);
-		}
-		if (rev.events & EPOLLOUT) {
-			dlog(LOG_INFO, "Ready to send message\n");
-			handle_output(rev.data.ptr);
-		}
+		handle_client(rev.events, rev.data.ptr);
 	}
 
 	return 0;
