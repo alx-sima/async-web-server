@@ -32,6 +32,8 @@
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define SIZE(x) (sizeof(x) / sizeof(*(x)))
 
+static const char ERROR_404_HEADER[] = "HTTP/1.1 404 Not Found\r\n\r\n";
+
 /* server socket file descriptor */
 static int listenfd;
 
@@ -68,7 +70,7 @@ static void connection_prepare_send_reply_header(struct connection *conn)
 static void connection_prepare_send_404(struct connection *conn)
 {
 	conn->state = STATE_SENDING_404;
-	strcpy(conn->send_buffer, "HTTP/1.1 404 Not Found\r\n\r\n");
+	strncpy(conn->send_buffer, ERROR_404_HEADER, SIZE(ERROR_404_HEADER));
 	conn->send_len = strlen(conn->send_buffer);
 }
 
@@ -111,6 +113,7 @@ struct connection *connection_create(int sockfd)
 	conn->state = STATE_INITIAL;
 	conn->async_read_len = 0;
 	conn->file_pos = 0;
+	conn->recv_len = 0;
 
 	memset(conn->send_buffer, 0, BUFSIZ);
 	return conn;
@@ -135,14 +138,16 @@ void connection_start_async_io(struct connection *conn)
 	struct iocb *pchunks[CHUNKS];
 	int used_chunks =
 		conn->send_len / CHUNK_SIZE + (conn->send_len % CHUNK_SIZE != 0);
-	int offset = conn->file_pos;
+	int offset = 0;
 
-	for (int i = 0; i < used_chunks; ++i) {
+	for (int i = 0; i < used_chunks; i++) {
 		int size = MIN(CHUNK_SIZE, conn->file_size - offset);
 
-		io_prep_pread(&chunks[i], conn->fd, conn->send_buffer, size, offset);
+		io_prep_pread(&chunks[i], conn->fd, conn->send_buffer + offset, size,
+					  conn->file_pos);
 		io_set_eventfd(&chunks[i], conn->eventfd);
 		pchunks[i] = &chunks[i];
+		conn->file_pos += size;
 		offset += CHUNK_SIZE;
 	}
 	rc = io_submit(conn->ctx, used_chunks, pchunks);
@@ -239,6 +244,7 @@ void receive_data(struct connection *conn)
 	/* A HTTP request must end in 2 newlines. */
 	if (strstr(conn->recv_buffer, "\r\n\r\n") != NULL) {
 		parse_header(conn);
+		dlog(LOG_DEBUG, "Parsed HTTP request\n");
 
 		conn->res_type = connection_get_resource_type(conn);
 		if (conn->res_type == RESOURCE_TYPE_NONE)
@@ -331,6 +337,9 @@ int connection_send_data(struct connection *conn)
 {
 	int rc;
 
+	fwrite(conn->send_buffer + conn->send_pos, sizeof(char),
+		   conn->send_len - conn->send_pos, stdout);
+	fprintf(stdout, "\n");
 	rc = send(conn->sockfd, conn->send_buffer + conn->send_pos,
 			  conn->send_len - conn->send_pos, O_NONBLOCK);
 	if (rc < 0)
@@ -373,7 +382,6 @@ int connection_send_dynamic(struct connection *conn)
 	}
 
 	dlog(LOG_DEBUG, "Sent round of %d bytes\n", rc);
-	conn->file_pos += rc;
 	return rc;
 }
 
@@ -439,6 +447,7 @@ void handle_output(struct connection *conn)
 
 	/* The header was sent. */
 	case STATE_SENDING_HEADER:
+		dlog(LOG_INFO, "Header sent\n");
 		if (conn->res_type == RESOURCE_TYPE_STATIC)
 			connection_send_static(conn);
 		else
