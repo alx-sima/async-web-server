@@ -32,8 +32,6 @@
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define SIZE(x) (sizeof(x) / sizeof(*(x)))
 
-static const char ERROR_404_HEADER[] = "HTTP/1.1 404 Not Found\r\n\r\n";
-
 /* server socket file descriptor */
 static int listenfd;
 
@@ -56,7 +54,7 @@ static void connection_prepare_send_reply_header(struct connection *conn)
 {
 	conn->state = STATE_SENDING_HEADER;
 
-	snprintf(conn->send_buffer, BUFSIZ,
+	snprintf(conn->send_buffer, SIZE(conn->send_buffer),
 			 "HTTP/1.1 200 OK\r\n"
 			 "Connexion: close\r\n"
 			 "Content-Length: %ld\r\n"
@@ -70,7 +68,8 @@ static void connection_prepare_send_reply_header(struct connection *conn)
 static void connection_prepare_send_404(struct connection *conn)
 {
 	conn->state = STATE_SENDING_404;
-	strncpy(conn->send_buffer, ERROR_404_HEADER, SIZE(ERROR_404_HEADER));
+	snprintf(conn->send_buffer, SIZE(conn->send_buffer),
+			 "HTTP/1.1 404 Not Found\r\n\r\n");
 	conn->send_len = strlen(conn->send_buffer);
 }
 
