@@ -26,8 +26,10 @@
 #include "utils/util.h"
 #include "utils/w_epoll.h"
 
-#define CHUNKS 16
+#define CHUNKS 8
 #define CHUNK_SIZE (BUFSIZ / CHUNKS)
+
+#define MAXEVENTS CHUNKS
 
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define SIZE(x) (sizeof(x) / sizeof(*(x)))
@@ -53,24 +55,20 @@ static int aws_on_path_cb(http_parser *p, const char *buf, size_t len)
 static void connection_prepare_send_reply_header(struct connection *conn)
 {
 	conn->state = STATE_SENDING_HEADER;
-
-	snprintf(conn->send_buffer, SIZE(conn->send_buffer),
-			 "HTTP/1.1 200 OK\r\n"
-			 "Connexion: close\r\n"
-			 "Content-Length: %ld\r\n"
-			 "\r\n",
-			 conn->file_size);
-	conn->send_len = strlen(conn->send_buffer);
-	dlog(LOG_DEBUG, "Prepared reply header (%lu bytes)\n", conn->send_len);
+	conn->send_len = snprintf(conn->send_buffer, SIZE(conn->send_buffer),
+							  "HTTP/1.1 200 OK\r\n"
+							  "Connexion: close\r\n"
+							  "Content-Length: %ld\r\n"
+							  "\r\n",
+							  conn->file_size);
 }
 
 /** Prepare the connection buffer to send the 404 header. */
 static void connection_prepare_send_404(struct connection *conn)
 {
 	conn->state = STATE_SENDING_404;
-	snprintf(conn->send_buffer, SIZE(conn->send_buffer),
-			 "HTTP/1.1 404 Not Found\r\n\r\n");
-	conn->send_len = strlen(conn->send_buffer);
+	conn->send_len = snprintf(conn->send_buffer, SIZE(conn->send_buffer),
+							  "HTTP/1.1 404 Not Found\r\n\r\n");
 }
 
 /**
@@ -89,10 +87,8 @@ static enum resource_type connection_get_resource_type(struct connection *conn)
 		type = RESOURCE_TYPE_DYNAMIC;
 
 	if (connection_open_file(conn) < 0) {
-		/* File doesn't exist, send a 404. */
-		if (errno == ENOENT)
-			return RESOURCE_TYPE_NONE;
-		// TODO
+		/* File cannot be accessed, send a 404. */
+		return RESOURCE_TYPE_NONE;
 	}
 	return type;
 }
@@ -105,6 +101,7 @@ struct connection *connection_create(int sockfd)
 	conn = malloc(sizeof(*conn));
 	DIE(!conn, "malloc");
 
+	conn->fd = -1;
 	conn->sockfd = sockfd;
 	conn->eventfd = eventfd(0, EFD_NONBLOCK);
 	DIE(conn->eventfd < 0, "eventfd");
@@ -114,44 +111,9 @@ struct connection *connection_create(int sockfd)
 	conn->file_pos = 0;
 	conn->recv_len = 0;
 
-	memset(conn->send_buffer, 0, BUFSIZ);
-	return conn;
-}
-
-void connection_start_async_io(struct connection *conn)
-{
-	/* TODO: Start asynchronous operation (read from file).
-	 * Use io_submit(2) & friends for reading data asynchronously.
-	 */
-	conn->state = STATE_ASYNC_ONGOING;
-	dlog(LOG_DEBUG, "Starting async IO\n");
-
+	memset(conn->recv_buffer, 0, SIZE(conn->recv_buffer));
 	memset(conn->send_buffer, 0, SIZE(conn->send_buffer));
-	conn->send_pos = 0;
-
-	int rc = w_epoll_add_ptr_in(epollfd, conn->eventfd, conn);
-
-	io_setup(CHUNKS, &conn->ctx);
-	conn->send_len = MIN(BUFSIZ, conn->file_size - conn->file_pos);
-	struct iocb chunks[CHUNKS];
-	struct iocb *pchunks[CHUNKS];
-	int used_chunks =
-		conn->send_len / CHUNK_SIZE + (conn->send_len % CHUNK_SIZE != 0);
-	int offset = 0;
-
-	for (int i = 0; i < used_chunks; i++) {
-		int size = MIN(CHUNK_SIZE, conn->file_size - offset);
-
-		io_prep_pread(&chunks[i], conn->fd, conn->send_buffer + offset, size,
-					  conn->file_pos);
-		io_set_eventfd(&chunks[i], conn->eventfd);
-		pchunks[i] = &chunks[i];
-		conn->file_pos += size;
-		offset += CHUNK_SIZE;
-	}
-	rc = io_submit(conn->ctx, used_chunks, pchunks);
-	w_epoll_remove_ptr(epollfd, conn->sockfd, conn);
-	DIE(rc < 0, "io_submit");
+	return conn;
 }
 
 /** Remove connection handler. */
@@ -167,55 +129,72 @@ void connection_remove(struct connection *conn)
 		dlog(LOG_INFO, "Closing connection with %s\n", addrbuf);
 
 	rc = w_epoll_remove_ptr(epollfd, conn->sockfd, conn);
-	if (rc < 0)
+	if (rc < 0 && errno != ENOENT)
 		dlog(LOG_ERR, "w_epoll_remove_ptr: %s\n", strerror(errno));
-
 	rc = w_epoll_remove_ptr(epollfd, conn->eventfd, conn);
-	if (rc < 0)
+	if (rc < 0 && errno != ENOENT)
 		dlog(LOG_ERR, "w_epoll_remove_ptr: %s\n", strerror(errno));
 
-	rc = close(conn->fd);
-	if (rc < 0)
-		dlog(LOG_ERR, "close: %s\n", strerror(errno));
-
-	rc = close(conn->sockfd);
-	if (rc < 0)
-		dlog(LOG_ERR, "close: %s\n", strerror(errno));
-
+	if (conn->fd != -1) {
+		rc = close(conn->fd);
+		if (rc < 0)
+			dlog(LOG_ERR, "close: %s\n", strerror(errno));
+	}
 	rc = close(conn->eventfd);
-	if (rc < 0)
+	if (rc < 0 && errno != ENOENT)
+		dlog(LOG_ERR, "close: %s\n", strerror(errno));
+	rc = close(conn->sockfd);
+	if (rc < 0 && errno != ENOENT)
 		dlog(LOG_ERR, "close: %s\n", strerror(errno));
 
 	free(conn);
 }
 
+/** Handle a new connection request on the server socket. */
 void handle_new_connection(void)
 {
 	struct connection *conn;
 	struct sockaddr_in addr;
 	socklen_t addrlen = sizeof(addr);
+	char addrbuf[64];
 	int sockfd;
 	int rc;
 
-	/* Handle a new connection request on the server socket. */
-
 	/* Accept new connection. */
 	sockfd = accept(listenfd, (SSA *)&addr, &addrlen);
-	DIE(sockfd < 0, "accept");
+	if (sockfd < 0) {
+		dlog(LOG_ERR, "accept: %s\n", strerror(errno));
+		return;
+	}
 
-	dlog(LOG_INFO, "Accepted connection from: %s:%d\n",
-		 inet_ntoa(addr.sin_addr), ntohs(addr.sin_port));
+	rc = get_peer_address(sockfd, addrbuf, sizeof(addrbuf));
+	if (rc < 0) {
+		dlog(LOG_ERR, "get_peer_address: %s\n", strerror(errno));
+		return;
+	}
+
+	dlog(LOG_INFO, "Accepted connection from: %s\n", addrbuf);
 
 	/* Set socket to be non-blocking. */
 	rc = fcntl(sockfd, F_SETFL, O_NONBLOCK);
-	DIE(rc < 0, "fcntl");
+	if (rc < 0) {
+		dlog(LOG_ERR, "fcntl: %s\n", strerror(errno));
+		rc = close(sockfd);
+		if (rc < 0)
+			dlog(LOG_ERR, "close: %s\n", strerror(errno));
+		return;
+	}
 
 	/* Instantiate new connection handler. */
 	conn = connection_create(sockfd);
 
 	/* Add socket to epoll. */
 	rc = w_epoll_add_ptr_in(epollfd, sockfd, conn);
-	DIE(rc < 0, "w_epoll_add_ptr_in");
+	if (rc < 0) {
+		dlog(LOG_ERR, "w_epoll_add_ptr_in: %s\n", strerror(errno));
+		connection_remove(conn);
+		return;
+	}
 
 	/* Initialize HTTP_REQUEST parser. */
 	http_parser_init(&conn->request_parser, HTTP_REQUEST);
@@ -224,13 +203,14 @@ void handle_new_connection(void)
 
 /**
  * Receive message on socket.
- * Store message in recv_buffer in struct connection.
+ * Store message in `recv_buffer` in struct connection.
  */
 void receive_data(struct connection *conn)
 {
 	int rc;
 
-	rc = recv(conn->sockfd, conn->recv_buffer + conn->recv_len, BUFSIZ, 0);
+	rc = recv(conn->sockfd, conn->recv_buffer + conn->recv_len, BUFSIZ,
+			  O_NONBLOCK);
 	if (rc < 0) {
 		dlog(LOG_ERR, "Error in communication\n");
 		connection_remove(conn);
@@ -239,11 +219,12 @@ void receive_data(struct connection *conn)
 		connection_remove(conn);
 	}
 
+	dlog(LOG_DEBUG, "Received %d bytes\n", rc);
 	conn->recv_len += rc;
+
 	/* A HTTP request must end in 2 newlines. */
 	if (strstr(conn->recv_buffer, "\r\n\r\n") != NULL) {
 		parse_header(conn);
-		dlog(LOG_DEBUG, "Parsed HTTP request\n");
 
 		conn->res_type = connection_get_resource_type(conn);
 		if (conn->res_type == RESOURCE_TYPE_NONE)
@@ -252,6 +233,7 @@ void receive_data(struct connection *conn)
 		else
 			connection_prepare_send_reply_header(conn);
 
+		dlog(LOG_DEBUG, "Prepared reply header (%lu bytes)\n", conn->send_len);
 		/* Track the sending of the packages over the socket. */
 		w_epoll_update_ptr_out(epollfd, conn->sockfd, conn);
 	}
@@ -262,6 +244,7 @@ int connection_open_file(struct connection *conn)
 {
 	char path[BUFSIZ] = AWS_DOCUMENT_ROOT;
 	struct stat stat;
+	int rc;
 
 	strncat(path, conn->request_path, SIZE(path) - strlen(path) - 1);
 
@@ -269,21 +252,181 @@ int connection_open_file(struct connection *conn)
 	if (conn->fd < 0)
 		return conn->fd;
 
-	fstat(conn->fd, &stat);
+	rc = fstat(conn->fd, &stat);
+	if (rc < 0)
+		return rc;
+
 	conn->file_size = stat.st_size;
 	return conn->fd;
 }
 
+/**
+ * Send as much data as possible from the connection send buffer.
+ * Returns the number of bytes sent or -1 if an error occurred
+ */
+int connection_send_data(struct connection *conn)
+{
+	int rc;
+
+	rc = send(conn->sockfd, conn->send_buffer + conn->send_pos,
+			  conn->send_len - conn->send_pos, O_NONBLOCK);
+	if (rc < 0)
+		return rc;
+
+	conn->send_pos += rc;
+	return rc;
+}
+
+/** Send static data using `sendfile(2)`. */
+enum connection_state connection_send_static(struct connection *conn)
+{
+	conn->state = STATE_SENDING_DATA;
+	int rc;
+
+	rc = sendfile(conn->sockfd, conn->fd, NULL, conn->file_size);
+	DIE(rc < 0, "sendfile");
+
+	if (rc == 0) {
+		dlog(LOG_INFO, "Package sent\n");
+		connection_remove(conn);
+		return STATE_NO_STATE;
+	}
+
+	dlog(LOG_DEBUG, "Sent %d bytes of static data\n", rc);
+	conn->file_size -= rc;
+	return STATE_SENDING_DATA;
+}
+
+/**
+ * Send data asynchronously.
+ * Returns bytes sent on success and -1 on error.
+ */
+int connection_send_dynamic(struct connection *conn)
+{
+	int rc;
+
+	rc = connection_send_data(conn);
+	if (rc < 0) {
+		dlog(LOG_ERR, "Error sending package. Closing connection\n");
+		connection_remove(conn);
+		return -1;
+	}
+
+	if (rc == 0) {
+		if (conn->file_pos == conn->file_size) {
+			dlog(LOG_INFO,
+				 "Package sent completely (%ld bytes). Closing connection\n",
+				 conn->file_size);
+			connection_remove(conn);
+			return 0;
+		}
+
+		/* The file was larger than the buffer,
+		 * start reading another block again.
+		 */
+		dlog(LOG_INFO, "Sent block of %ld bytes (%ld remaining)\n",
+			 conn->send_len, conn->file_size - conn->file_pos);
+		connection_start_async_io(conn);
+		return 0;
+	}
+
+	dlog(LOG_DEBUG, "Sent round of %d bytes\n", rc);
+	return rc;
+}
+
+/**
+ * Launch at most `CHUNKS` asynchronous operations for reading data from file.
+ * Return the number of launched operations, or -1 if there was an error
+ * encountered.
+ */
+int launch_buffer_workers(struct connection *conn)
+{
+	int rc;
+
+	rc = io_setup(CHUNKS, &conn->ctx);
+	if (rc < 0)
+		return rc;
+
+	conn->send_len =
+		MIN(SIZE(conn->send_buffer), conn->file_size - conn->file_pos);
+
+	struct iocb iocbs[CHUNKS];
+	struct iocb *piocbs[CHUNKS];
+	int buffer_offset = 0;
+	int chnk = conn->send_len / CHUNK_SIZE + (conn->send_len % CHUNK_SIZE != 0);
+
+	for (int i = 0; i < chnk; i++) {
+		int size = MIN(CHUNK_SIZE, conn->file_size - buffer_offset);
+
+		io_prep_pread(&iocbs[i], conn->fd, conn->send_buffer + buffer_offset,
+					  size, conn->file_pos);
+		io_set_eventfd(&iocbs[i], conn->eventfd);
+
+		piocbs[i] = &iocbs[i];
+		conn->file_pos += size;
+		buffer_offset += size;
+	}
+
+	return io_submit(conn->ctx, chnk, piocbs);
+}
+
+/**
+ * Start asynchronous operation (read from file), using `io_submit(2)` & friends
+ * for reading data asynchronously.
+ */
+void connection_start_async_io(struct connection *conn)
+{
+	int rc;
+
+	conn->state = STATE_ASYNC_ONGOING;
+	dlog(LOG_DEBUG, "Starting async IO\n");
+
+	memset(conn->send_buffer, 0, SIZE(conn->send_buffer));
+	conn->async_read_len = 0;
+	conn->send_pos = 0;
+
+	/* Monitor eventfd to be notified when file reading ended. */
+	rc = w_epoll_add_ptr_in(epollfd, conn->eventfd, conn);
+	if (rc < 0)
+		goto close_connection;
+	rc = w_epoll_remove_ptr(epollfd, conn->sockfd, conn);
+	if (rc < 0)
+		goto close_connection;
+
+	rc = launch_buffer_workers(conn);
+	if (rc > 0)
+		return;
+
+close_connection:
+	dlog(LOG_ERR, "Error starting async IO. Closing connection\n");
+	connection_remove(conn);
+}
+
+/**
+ * Complete asynchronous operation; operation returns successfully.
+ * Prepare socket for sending.
+ */
 void connection_complete_async_io(struct connection *conn)
 {
-	/* TODO: Complete asynchronous operation; operation returns successfully.
-	 * Prepare socket for sending.
-	 */
+	int rc;
+
 	conn->state = STATE_SENDING_DATA;
 	conn->send_pos = 0;
-	w_epoll_add_ptr_out(epollfd, conn->sockfd, conn);
+
+	rc = w_epoll_add_ptr_out(epollfd, conn->sockfd, conn);
+	if (rc < 0)
+		goto close_connection;
+
+	rc = w_epoll_remove_ptr(epollfd, conn->eventfd, conn);
+	if (rc < 0)
+		goto close_connection;
 
 	dlog(LOG_DEBUG, "Async IO completed\n");
+	return;
+
+close_connection:
+	dlog(LOG_ERR, "Error completing async IO. Closing connection\n");
+	connection_remove(conn);
 }
 
 /** Parse the HTTP header and extract the file path. */
@@ -309,79 +452,54 @@ int parse_header(struct connection *conn)
 	return bytes_parsed;
 }
 
-enum connection_state connection_send_static(struct connection *conn)
+/**
+ * Return number of ready events for a
+ * given connection or 0 if no events are ready.
+ */
+static inline eventfd_t read_eventfd(struct connection *conn)
 {
-	/* TODO: Send static data using sendfile(2). */
-	conn->state = STATE_SENDING_DATA;
-	int rc;
+	eventfd_t nr;
+	int rc = read(conn->eventfd, &nr, sizeof(nr));
 
-	rc = sendfile(conn->sockfd, conn->fd, 0, conn->send_len);
-	DIE(rc < 0, "sendfile");
-
-	if (rc == 0) {
-		dlog(LOG_INFO, "Package sent\n");
-		connection_remove(conn);
-		return STATE_NO_STATE;
-	}
-
-	dlog(LOG_DEBUG, "Sent %d bytes of static data\n", rc);
-	return STATE_SENDING_DATA;
+	if (rc == sizeof(nr))
+		return nr;
+	return 0;
 }
 
 /**
- * Send as much data as possible from the connection send buffer.
- * Returns the number of bytes sent or -1 if an error occurred
+ * Get the results of `conn`'s asynchronous operations.
+ * The number of events is given by `nr`.
  */
-int connection_send_data(struct connection *conn)
+void get_io_event_results(struct connection *conn, eventfd_t nr)
 {
+	struct io_event events[MAXEVENTS];
 	int rc;
 
-	fwrite(conn->send_buffer + conn->send_pos, sizeof(char),
-		   conn->send_len - conn->send_pos, stdout);
-	fprintf(stdout, "\n");
-	rc = send(conn->sockfd, conn->send_buffer + conn->send_pos,
-			  conn->send_len - conn->send_pos, O_NONBLOCK);
-	if (rc < 0)
-		return rc;
+	while (nr) {
+		int event_slice = MIN(MAXEVENTS, nr);
 
-	conn->send_pos += rc;
-	return rc;
-}
-
-/**
- * Send data asynchronously.
- * Returns bytes sent on success and -1 on error.
- */
-int connection_send_dynamic(struct connection *conn)
-{
-	int rc;
-
-	rc = connection_send_data(conn);
-	if (rc < 0) {
-		ERR("send");
-		connection_remove(conn);
-		return -1;
-	}
-
-	if (rc == 0) {
-		if (conn->async_read_len == conn->file_size) {
-			dlog(LOG_INFO,
-				 "Package sent completely (%ld bytes). Closing connection\n",
-				 conn->file_size);
+		rc = io_getevents(conn->ctx, 1, event_slice, events, NULL);
+		if (rc < 0) {
+			dlog(LOG_ERR, "Failed retrieving events. Closing connection\n");
 			connection_remove(conn);
-			return 0;
+			return;
 		}
 
-		/* The file was larger than the buffer,
-		 * start reading another block again.
-		 */
-		dlog(LOG_INFO, "Sent block of %ld bytes\n", conn->send_len);
-		connection_start_async_io(conn);
-		return 0;
-	}
+		for (int i = 0; i < event_slice; i++) {
+			if (events[i].res < 0) {
+				dlog(LOG_ERR, "Error in async IO. Closing connection\n");
+				connection_remove(conn);
+				return;
+			}
 
-	dlog(LOG_DEBUG, "Sent round of %d bytes\n", rc);
-	return rc;
+			conn->async_read_len += events[i].res;
+			if (conn->async_read_len == conn->send_len)
+				/* Buffer was sent completely. */
+				connection_complete_async_io(conn);
+		}
+
+		nr -= event_slice;
+	}
 }
 
 /**
@@ -390,28 +508,14 @@ int connection_send_dynamic(struct connection *conn)
  */
 void handle_input(struct connection *conn)
 {
-	uint64_t nr;
-	int rc = read(conn->eventfd, &nr, sizeof(uint64_t));
+	eventfd_t nr = read_eventfd(conn);
 
-	if (rc == sizeof(uint64_t)) {
-		struct io_event events[nr];
-
-		io_getevents(conn->ctx, 1, nr, events, NULL);
-		for (int i = 0; i < nr; ++i) {
-			if (events[i].res < 0) {
-				ERR("io_getevents");
-				exit(1);
-			}
-
-			conn->async_read_len += events[i].res;
-			if (conn->async_read_len == conn->file_size ||
-				conn->async_read_len == SIZE(conn->send_buffer)) {
-				connection_complete_async_io(conn);
-			}
-		}
+	if (nr) {
+		get_io_event_results(conn, nr);
 		return;
 	}
 
+	dlog(LOG_INFO, "New message received\n");
 	receive_data(conn);
 }
 
@@ -426,9 +530,10 @@ void handle_output(struct connection *conn)
 
 	if (conn->state == STATE_SENDING_404 ||
 		conn->state == STATE_SENDING_HEADER) {
+		/* Send the header data. */
 		rc = connection_send_data(conn);
 		if (rc < 0) {
-			ERR("send");
+			dlog(LOG_ERR, "Error sending package. Closing connection\n");
 			connection_remove(conn);
 			return;
 		}
@@ -439,7 +544,7 @@ void handle_output(struct connection *conn)
 	}
 
 	switch (conn->state) {
-		/* A 404 error was sent. */
+	/* A 404 error was sent. */
 	case STATE_SENDING_404:
 		connection_remove(conn);
 		break;
@@ -447,6 +552,7 @@ void handle_output(struct connection *conn)
 	/* The header was sent. */
 	case STATE_SENDING_HEADER:
 		dlog(LOG_INFO, "Header sent\n");
+
 		if (conn->res_type == RESOURCE_TYPE_STATIC)
 			connection_send_static(conn);
 		else
@@ -454,6 +560,7 @@ void handle_output(struct connection *conn)
 
 		break;
 
+	/* Sending the file. */
 	case STATE_SENDING_DATA:
 		if (conn->res_type == RESOURCE_TYPE_STATIC)
 			connection_send_static(conn);
@@ -473,20 +580,10 @@ void handle_output(struct connection *conn)
  */
 void handle_client(uint32_t event, struct connection *conn)
 {
-	char addr[64];
-
-	if (get_peer_address(conn->sockfd, addr, SIZE(addr)) < 0) {
-		ERR("get_peer_address");
-		connection_remove(conn);
-		return;
-	}
-
-	if (event & EPOLLIN) {
-		dlog(LOG_INFO, "New message from %s\n", addr);
+	if (event & EPOLLIN)
 		handle_input(conn);
-	} else if (event & EPOLLOUT) {
+	else if (event & EPOLLOUT)
 		handle_output(conn);
-	}
 }
 
 int main(void)
@@ -527,11 +624,13 @@ int main(void)
 				dlog(LOG_INFO, "New connection\n");
 				handle_new_connection();
 			}
+
 			continue;
 		}
 
 		/* A connection socket got an I/O event. */
 		handle_client(rev.events, rev.data.ptr);
 	}
+
 	return 0;
 }
