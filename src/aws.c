@@ -110,6 +110,7 @@ struct connection *connection_create(int sockfd)
 	conn->async_read_len = 0;
 	conn->file_pos = 0;
 	conn->recv_len = 0;
+	conn->ctx = 0;
 
 	memset(conn->recv_buffer, 0, SIZE(conn->recv_buffer));
 	memset(conn->send_buffer, 0, SIZE(conn->send_buffer));
@@ -223,7 +224,7 @@ void receive_data(struct connection *conn)
 	conn->recv_len += rc;
 
 	/* A HTTP request must end in 2 newlines. */
-	if (strstr(conn->recv_buffer, "\r\n\r\n") != NULL) {
+	if (strstr(conn->recv_buffer, "\r\n\r\n")) {
 		parse_header(conn);
 
 		conn->res_type = connection_get_resource_type(conn);
@@ -283,7 +284,7 @@ enum connection_state connection_send_static(struct connection *conn)
 	conn->state = STATE_SENDING_DATA;
 	int rc;
 
-	rc = sendfile(conn->sockfd, conn->fd, NULL, conn->file_size);
+	rc = sendfile(conn->sockfd, conn->fd, 0, conn->file_size);
 	DIE(rc < 0, "sendfile");
 
 	if (rc == 0) {
@@ -344,8 +345,10 @@ int launch_buffer_workers(struct connection *conn)
 	int rc;
 
 	rc = io_setup(CHUNKS, &conn->ctx);
-	if (rc < 0)
+	if (rc < 0) {
+		puts("murii la io_setup");
 		return rc;
+	}
 
 	conn->send_len =
 		MIN(SIZE(conn->send_buffer), conn->file_size - conn->file_pos);
@@ -396,6 +399,7 @@ void connection_start_async_io(struct connection *conn)
 	rc = launch_buffer_workers(conn);
 	if (rc > 0)
 		return;
+	perror("io_submit");
 
 close_connection:
 	dlog(LOG_ERR, "Error starting async IO. Closing connection\n");
@@ -420,6 +424,11 @@ void connection_complete_async_io(struct connection *conn)
 	rc = w_epoll_remove_ptr(epollfd, conn->eventfd, conn);
 	if (rc < 0)
 		goto close_connection;
+
+	rc = io_destroy(conn->ctx);
+	if (rc < 0)
+		goto close_connection;
+	conn->ctx = 0;
 
 	dlog(LOG_DEBUG, "Async IO completed\n");
 	return;
@@ -478,7 +487,7 @@ void get_io_event_results(struct connection *conn, eventfd_t nr)
 	while (nr) {
 		int event_slice = MIN(MAXEVENTS, nr);
 
-		rc = io_getevents(conn->ctx, 1, event_slice, events, NULL);
+		rc = io_getevents(conn->ctx, 1, event_slice, events, 0);
 		if (rc < 0) {
 			dlog(LOG_ERR, "Failed retrieving events. Closing connection\n");
 			connection_remove(conn);
