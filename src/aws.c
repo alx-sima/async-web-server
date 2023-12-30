@@ -54,21 +54,29 @@ static int aws_on_path_cb(http_parser *p, const char *buf, size_t len)
 /** Prepare the connection buffer to send the reply header. */
 static void connection_prepare_send_reply_header(struct connection *conn)
 {
+	char buffer[BUFSIZ];
+
 	conn->state = STATE_SENDING_HEADER;
-	conn->send_len = snprintf(conn->send_buffer, SIZE(conn->send_buffer),
+	conn->send_len = snprintf(buffer, SIZE(buffer),
 							  "HTTP/1.1 200 OK\r\n"
 							  "Connexion: close\r\n"
 							  "Content-Length: %ld\r\n"
 							  "\r\n",
 							  conn->file_size);
+
+	conn->send_buffer = strdup(buffer);
+	if (!conn->send_buffer) {
+		dlog(LOG_ERR, "strdup: %s\n", strerror(errno));
+		connection_remove(conn);
+	}
 }
 
 /** Prepare the connection buffer to send the 404 header. */
 static void connection_prepare_send_404(struct connection *conn)
 {
 	conn->state = STATE_SENDING_404;
-	conn->send_len = snprintf(conn->send_buffer, SIZE(conn->send_buffer),
-							  "HTTP/1.1 404 Not Found\r\n\r\n");
+	conn->send_buffer = strdup("HTTP/1.1 404 Not Found\r\n\r\n");
+	conn->send_len = strlen(conn->send_buffer);
 }
 
 /**
@@ -113,7 +121,7 @@ struct connection *connection_create(int sockfd)
 	conn->ctx = 0;
 
 	memset(conn->recv_buffer, 0, SIZE(conn->recv_buffer));
-	memset(conn->send_buffer, 0, SIZE(conn->send_buffer));
+	conn->send_buffer = NULL;
 	return conn;
 }
 
@@ -148,6 +156,8 @@ void connection_remove(struct connection *conn)
 	if (rc < 0 && errno != ENOENT)
 		dlog(LOG_ERR, "close: %s\n", strerror(errno));
 
+	if (conn->send_buffer)
+		free(conn->send_buffer);
 	free(conn);
 }
 
@@ -271,8 +281,9 @@ int connection_send_data(struct connection *conn)
 
 	rc = send(conn->sockfd, conn->send_buffer + conn->send_pos,
 			  conn->send_len - conn->send_pos, O_NONBLOCK);
-	if (rc < 0)
+	if (rc < 0) {
 		return rc;
+	}
 
 	conn->send_pos += rc;
 	return rc;
@@ -345,32 +356,24 @@ int launch_buffer_workers(struct connection *conn)
 	int rc;
 
 	rc = io_setup(CHUNKS, &conn->ctx);
-	if (rc < 0) {
-		puts("murii la io_setup");
+	if (rc < 0)
 		return rc;
+
+	conn->send_len = conn->file_size;
+	conn->send_buffer = realloc(conn->send_buffer, conn->send_len + 1);
+	if (!conn->send_buffer) {
+		dlog(LOG_ERR, "realloc: %s\n", strerror(errno));
+		return -1;
 	}
 
-	conn->send_len =
-		MIN(SIZE(conn->send_buffer), conn->file_size - conn->file_pos);
+	io_prep_pread(&conn->iocb, conn->fd, conn->send_buffer, conn->send_len,
+				  conn->file_pos);
+	io_set_eventfd(&conn->iocb, conn->eventfd);
 
-	struct iocb iocbs[CHUNKS];
-	struct iocb *piocbs[CHUNKS];
-	int buffer_offset = 0;
-	int chnk = conn->send_len / CHUNK_SIZE + (conn->send_len % CHUNK_SIZE != 0);
+	conn->file_pos += conn->send_len;
+	*conn->piocb = &conn->iocb;
 
-	for (int i = 0; i < chnk; i++) {
-		int size = MIN(CHUNK_SIZE, conn->file_size - buffer_offset);
-
-		io_prep_pread(&iocbs[i], conn->fd, conn->send_buffer + buffer_offset,
-					  size, conn->file_pos);
-		io_set_eventfd(&iocbs[i], conn->eventfd);
-
-		piocbs[i] = &iocbs[i];
-		conn->file_pos += size;
-		buffer_offset += size;
-	}
-
-	return io_submit(conn->ctx, chnk, piocbs);
+	return io_submit(conn->ctx, 1, conn->piocb);
 }
 
 /**
@@ -384,9 +387,8 @@ void connection_start_async_io(struct connection *conn)
 	conn->state = STATE_ASYNC_ONGOING;
 	dlog(LOG_DEBUG, "Starting async IO\n");
 
-	memset(conn->send_buffer, 0, SIZE(conn->send_buffer));
+	// memset(conn->send_buffer, 0, SIZE(conn->send_buffer));
 	conn->async_read_len = 0;
-	conn->send_pos = 0;
 
 	/* Monitor eventfd to be notified when file reading ended. */
 	rc = w_epoll_add_ptr_in(epollfd, conn->eventfd, conn);
@@ -434,7 +436,7 @@ void connection_complete_async_io(struct connection *conn)
 	return;
 
 close_connection:
-	dlog(LOG_ERR, "Error completing async IO. Closing connection\n");
+	// dlog(LOG_ERR, "Error completing async IO. Closing connection\n");
 	connection_remove(conn);
 }
 

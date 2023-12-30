@@ -61,7 +61,7 @@ struct connection {
 	size_t recv_len;
 
 	/* Used for sending data (headers, 404 or data populated through async IO). */
-	char send_buffer[BUFSIZ];
+	char *send_buffer;
 	size_t send_len;
 	size_t send_pos;
 	size_t file_pos;
