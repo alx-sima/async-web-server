@@ -26,13 +26,12 @@
 #include "utils/util.h"
 #include "utils/w_epoll.h"
 
-#define CHUNKS 8
-#define CHUNK_SIZE (BUFSIZ / CHUNKS)
-
-#define MAXEVENTS CHUNKS
+#define MAXEVENTS 8
 
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define SIZE(x) (sizeof(x) / sizeof(*(x)))
+
+#define LOG_ERRNO(funcname) dlog(LOG_ERR, "%s: %s\n", funcname, strerror(errno))
 
 /* server socket file descriptor */
 static int listenfd;
@@ -65,10 +64,7 @@ static void connection_prepare_send_reply_header(struct connection *conn)
 							  conn->file_size);
 
 	conn->send_buffer = strdup(buffer);
-	if (!conn->send_buffer) {
-		dlog(LOG_ERR, "strdup: %s\n", strerror(errno));
-		connection_remove(conn);
-	}
+	DIE(conn->send_buffer == NULL, "strdup");
 }
 
 /** Prepare the connection buffer to send the 404 header. */
@@ -76,6 +72,7 @@ static void connection_prepare_send_404(struct connection *conn)
 {
 	conn->state = STATE_SENDING_404;
 	conn->send_buffer = strdup("HTTP/1.1 404 Not Found\r\n\r\n");
+	DIE(conn->send_buffer == NULL, "strdup");
 	conn->send_len = strlen(conn->send_buffer);
 }
 
@@ -89,9 +86,10 @@ static enum resource_type connection_get_resource_type(struct connection *conn)
 	static const char dynamic_path[] = "/dynamic";
 	enum resource_type type = RESOURCE_TYPE_NONE;
 
-	if (!strncmp(conn->request_path, static_path, SIZE(static_path) - 1))
+	if (strncmp(conn->request_path, static_path, SIZE(static_path) - 1) == 0)
 		type = RESOURCE_TYPE_STATIC;
-	else if (!strncmp(conn->request_path, dynamic_path, SIZE(dynamic_path) - 1))
+	else if (strncmp(conn->request_path, dynamic_path,
+					 SIZE(dynamic_path) - 1) == 0)
 		type = RESOURCE_TYPE_DYNAMIC;
 
 	if (connection_open_file(conn) < 0) {
@@ -107,7 +105,7 @@ struct connection *connection_create(int sockfd)
 	struct connection *conn;
 
 	conn = malloc(sizeof(*conn));
-	DIE(!conn, "malloc");
+	DIE(conn == NULL, "malloc");
 
 	conn->fd = -1;
 	conn->sockfd = sockfd;
@@ -116,7 +114,6 @@ struct connection *connection_create(int sockfd)
 
 	conn->state = STATE_INITIAL;
 	conn->async_read_len = 0;
-	conn->file_pos = 0;
 	conn->recv_len = 0;
 	conn->ctx = 0;
 
@@ -133,28 +130,28 @@ void connection_remove(struct connection *conn)
 
 	rc = get_peer_address(conn->sockfd, addrbuf, sizeof(addrbuf));
 	if (rc < 0)
-		dlog(LOG_ERR, "get_peer_address: %s\n", strerror(errno));
+		LOG_ERRNO("get_peer_address");
 	else
 		dlog(LOG_INFO, "Closing connection with %s\n", addrbuf);
 
 	rc = w_epoll_remove_ptr(epollfd, conn->sockfd, conn);
 	if (rc < 0 && errno != ENOENT)
-		dlog(LOG_ERR, "w_epoll_remove_ptr: %s\n", strerror(errno));
+		LOG_ERRNO("w_epoll_remove_ptr");
 	rc = w_epoll_remove_ptr(epollfd, conn->eventfd, conn);
 	if (rc < 0 && errno != ENOENT)
-		dlog(LOG_ERR, "w_epoll_remove_ptr: %s\n", strerror(errno));
+		LOG_ERRNO("w_epoll_remove_ptr");
 
 	if (conn->fd != -1) {
 		rc = close(conn->fd);
 		if (rc < 0)
-			dlog(LOG_ERR, "close: %s\n", strerror(errno));
+			LOG_ERRNO("close");
 	}
 	rc = close(conn->eventfd);
 	if (rc < 0 && errno != ENOENT)
-		dlog(LOG_ERR, "close: %s\n", strerror(errno));
+		LOG_ERRNO("close");
 	rc = close(conn->sockfd);
 	if (rc < 0 && errno != ENOENT)
-		dlog(LOG_ERR, "close: %s\n", strerror(errno));
+		LOG_ERRNO("close");
 
 	if (conn->send_buffer)
 		free(conn->send_buffer);
@@ -174,27 +171,27 @@ void handle_new_connection(void)
 	/* Accept new connection. */
 	sockfd = accept(listenfd, (SSA *)&addr, &addrlen);
 	if (sockfd < 0) {
-		dlog(LOG_ERR, "accept: %s\n", strerror(errno));
+		LOG_ERRNO("accept");
 		return;
 	}
 
 	rc = get_peer_address(sockfd, addrbuf, sizeof(addrbuf));
 	if (rc < 0) {
-		dlog(LOG_ERR, "get_peer_address: %s\n", strerror(errno));
+		LOG_ERRNO("get_peer_address");
 		return;
 	}
 
 	dlog(LOG_INFO, "Accepted connection from: %s\n", addrbuf);
 
+	/* Get previous fd attributes in order to update them. */
+	rc = fcntl(sockfd, F_GETFL, 0);
+	if (rc < 0)
+		goto fcntl_error;
+
 	/* Set socket to be non-blocking. */
-	rc = fcntl(sockfd, F_SETFL, O_NONBLOCK);
-	if (rc < 0) {
-		dlog(LOG_ERR, "fcntl: %s\n", strerror(errno));
-		rc = close(sockfd);
-		if (rc < 0)
-			dlog(LOG_ERR, "close: %s\n", strerror(errno));
-		return;
-	}
+	rc = fcntl(sockfd, F_SETFL, rc | O_NONBLOCK);
+	if (rc < 0)
+		goto fcntl_error;
 
 	/* Instantiate new connection handler. */
 	conn = connection_create(sockfd);
@@ -202,7 +199,7 @@ void handle_new_connection(void)
 	/* Add socket to epoll. */
 	rc = w_epoll_add_ptr_in(epollfd, sockfd, conn);
 	if (rc < 0) {
-		dlog(LOG_ERR, "w_epoll_add_ptr_in: %s\n", strerror(errno));
+		LOG_ERRNO("w_epoll_add_ptr_in");
 		connection_remove(conn);
 		return;
 	}
@@ -210,6 +207,13 @@ void handle_new_connection(void)
 	/* Initialize HTTP_REQUEST parser. */
 	http_parser_init(&conn->request_parser, HTTP_REQUEST);
 	conn->request_parser.data = conn;
+	return;
+
+fcntl_error:
+	LOG_ERRNO("fcntl");
+	rc = close(sockfd);
+	if (rc < 0)
+		LOG_ERRNO("close");
 }
 
 /**
@@ -220,14 +224,14 @@ void receive_data(struct connection *conn)
 {
 	int rc;
 
-	rc = recv(conn->sockfd, conn->recv_buffer + conn->recv_len, BUFSIZ,
-			  O_NONBLOCK);
-	if (rc < 0) {
-		dlog(LOG_ERR, "Error in communication\n");
+	rc = recv(conn->sockfd, conn->recv_buffer + conn->recv_len, BUFSIZ, 0);
+	if (rc <= 0) {
+		if (rc == 0)
+			dlog(LOG_ERR, "Connection closed by peer\n");
+		else
+			dlog(LOG_ERR, "Error in communication\n");
 		connection_remove(conn);
-	} else if (rc == 0) {
-		dlog(LOG_ERR, "Connection closed by peer\n");
-		connection_remove(conn);
+		return;
 	}
 
 	dlog(LOG_DEBUG, "Received %d bytes\n", rc);
@@ -245,8 +249,10 @@ void receive_data(struct connection *conn)
 			connection_prepare_send_reply_header(conn);
 
 		dlog(LOG_DEBUG, "Prepared reply header (%lu bytes)\n", conn->send_len);
+
 		/* Track the sending of the packages over the socket. */
 		w_epoll_update_ptr_out(epollfd, conn->sockfd, conn);
+		conn->send_pos = 0;
 	}
 }
 
@@ -280,10 +286,9 @@ int connection_send_data(struct connection *conn)
 	int rc;
 
 	rc = send(conn->sockfd, conn->send_buffer + conn->send_pos,
-			  conn->send_len - conn->send_pos, O_NONBLOCK);
-	if (rc < 0) {
+			  conn->send_len - conn->send_pos, 0);
+	if (rc < 0)
 		return rc;
-	}
 
 	conn->send_pos += rc;
 	return rc;
@@ -296,10 +301,11 @@ enum connection_state connection_send_static(struct connection *conn)
 	int rc;
 
 	rc = sendfile(conn->sockfd, conn->fd, 0, conn->file_size);
-	DIE(rc < 0, "sendfile");
-
-	if (rc == 0) {
-		dlog(LOG_INFO, "Package sent\n");
+	if (rc <= 0) {
+		if (rc == 0)
+			dlog(LOG_INFO, "Package sent\n");
+		else
+			dlog(LOG_ERR, "Error sending package. Closing connection\n");
 		connection_remove(conn);
 		return STATE_NO_STATE;
 	}
@@ -325,20 +331,10 @@ int connection_send_dynamic(struct connection *conn)
 	}
 
 	if (rc == 0) {
-		if (conn->file_pos == conn->file_size) {
-			dlog(LOG_INFO,
-				 "Package sent completely (%ld bytes). Closing connection\n",
-				 conn->file_size);
-			connection_remove(conn);
-			return 0;
-		}
-
-		/* The file was larger than the buffer,
-		 * start reading another block again.
-		 */
-		dlog(LOG_INFO, "Sent block of %ld bytes (%ld remaining)\n",
-			 conn->send_len, conn->file_size - conn->file_pos);
-		connection_start_async_io(conn);
+		dlog(LOG_INFO,
+			 "Package sent completely (%ld bytes). Closing connection\n",
+			 conn->file_size);
+		connection_remove(conn);
 		return 0;
 	}
 
@@ -347,31 +343,25 @@ int connection_send_dynamic(struct connection *conn)
 }
 
 /**
- * Launch at most `CHUNKS` asynchronous operations for reading data from file.
+ * Launch an asynchronous operation for reading data from the file.
  * Return the number of launched operations, or -1 if there was an error
  * encountered.
  */
-int launch_buffer_workers(struct connection *conn)
+int launch_buffer_worker(struct connection *conn)
 {
 	int rc;
 
-	rc = io_setup(CHUNKS, &conn->ctx);
+	rc = io_setup(1, &conn->ctx);
 	if (rc < 0)
 		return rc;
 
-	conn->send_len = conn->file_size;
-	conn->send_buffer = realloc(conn->send_buffer, conn->send_len + 1);
-	if (!conn->send_buffer) {
-		dlog(LOG_ERR, "realloc: %s\n", strerror(errno));
-		return -1;
-	}
-
-	io_prep_pread(&conn->iocb, conn->fd, conn->send_buffer, conn->send_len,
-				  conn->file_pos);
-	io_set_eventfd(&conn->iocb, conn->eventfd);
-
-	conn->file_pos += conn->send_len;
 	*conn->piocb = &conn->iocb;
+	conn->send_len = conn->file_size;
+	conn->send_buffer = realloc(conn->send_buffer, conn->send_len);
+	DIE(conn->send_buffer == NULL, "realloc");
+
+	io_prep_pread(&conn->iocb, conn->fd, conn->send_buffer, conn->send_len, 0);
+	io_set_eventfd(&conn->iocb, conn->eventfd);
 
 	return io_submit(conn->ctx, 1, conn->piocb);
 }
@@ -387,9 +377,6 @@ void connection_start_async_io(struct connection *conn)
 	conn->state = STATE_ASYNC_ONGOING;
 	dlog(LOG_DEBUG, "Starting async IO\n");
 
-	// memset(conn->send_buffer, 0, SIZE(conn->send_buffer));
-	conn->async_read_len = 0;
-
 	/* Monitor eventfd to be notified when file reading ended. */
 	rc = w_epoll_add_ptr_in(epollfd, conn->eventfd, conn);
 	if (rc < 0)
@@ -398,10 +385,9 @@ void connection_start_async_io(struct connection *conn)
 	if (rc < 0)
 		goto close_connection;
 
-	rc = launch_buffer_workers(conn);
+	rc = launch_buffer_worker(conn);
 	if (rc > 0)
 		return;
-	perror("io_submit");
 
 close_connection:
 	dlog(LOG_ERR, "Error starting async IO. Closing connection\n");
@@ -436,7 +422,7 @@ void connection_complete_async_io(struct connection *conn)
 	return;
 
 close_connection:
-	// dlog(LOG_ERR, "Error completing async IO. Closing connection\n");
+	dlog(LOG_ERR, "Error completing async IO. Closing connection\n");
 	connection_remove(conn);
 }
 
@@ -454,7 +440,7 @@ int parse_header(struct connection *conn)
 											 .on_body = 0,
 											 .on_headers_complete = 0,
 											 .on_message_complete = 0};
-	size_t bytes_parsed =
+	const size_t bytes_parsed =
 		http_parser_execute(&conn->request_parser, &settings_on_path,
 							conn->recv_buffer, conn->recv_len);
 
@@ -487,16 +473,17 @@ void get_io_event_results(struct connection *conn, eventfd_t nr)
 	int rc;
 
 	while (nr) {
-		int event_slice = MIN(MAXEVENTS, nr);
 
-		rc = io_getevents(conn->ctx, 1, event_slice, events, 0);
+		rc = io_getevents(conn->ctx, 1, MAXEVENTS, events, 0);
 		if (rc < 0) {
 			dlog(LOG_ERR, "Failed retrieving events. Closing connection\n");
 			connection_remove(conn);
 			return;
 		}
 
-		for (int i = 0; i < event_slice; i++) {
+		const int event_no = rc;
+
+		for (int i = 0; i < event_no; i++) {
 			if (events[i].res < 0) {
 				dlog(LOG_ERR, "Error in async IO. Closing connection\n");
 				connection_remove(conn);
@@ -509,7 +496,7 @@ void get_io_event_results(struct connection *conn, eventfd_t nr)
 				connection_complete_async_io(conn);
 		}
 
-		nr -= event_slice;
+		nr -= event_no;
 	}
 }
 
@@ -519,7 +506,7 @@ void get_io_event_results(struct connection *conn, eventfd_t nr)
  */
 void handle_input(struct connection *conn)
 {
-	eventfd_t nr = read_eventfd(conn);
+	const eventfd_t nr = read_eventfd(conn);
 
 	if (nr) {
 		get_io_event_results(conn, nr);
