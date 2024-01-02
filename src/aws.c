@@ -473,7 +473,6 @@ void get_io_event_results(struct connection *conn, eventfd_t nr)
 	int rc;
 
 	while (nr) {
-
 		rc = io_getevents(conn->ctx, 1, MAXEVENTS, events, 0);
 		if (rc < 0) {
 			dlog(LOG_ERR, "Failed retrieving events. Closing connection\n");
